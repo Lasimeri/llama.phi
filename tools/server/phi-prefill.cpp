@@ -91,6 +91,30 @@ bool phi_prefill::init(const common_params & base) {
     }
     min_tokens = (size_t) env_int("PHI_PREFILL_MIN", 64);
     n_ubatch   = p.n_ubatch;
+    // The prefill model's devices: those whose name starts with
+    // PHI_PREFILL_DEVICES (default "CUDA"), so a backend meant for the
+    // decode side alone (the cards' libggml_phi.so, whose glue keeps
+    // per-graph tables that two contexts must not share) never sees this
+    // model; the CPU is implicit.
+    {
+        const char * want = env_str("PHI_PREFILL_DEVICES");
+        const std::string prefix = want ? want : "CUDA";
+        p.devices.clear();
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto * dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            const std::string name = ggml_backend_dev_name(dev);
+            if (name.compare(0, prefix.size(), prefix) == 0) {
+                p.devices.push_back(dev);
+            }
+        }
+        if (p.devices.empty()) {
+            LOG_ERR("phi-prefill: no device named %s*\n", prefix.c_str());
+            return false;
+        }
+    }
 
     size_t n_overrides = 0;
     for (const auto & o : p.tensor_buft_overrides) {

@@ -97,3 +97,24 @@ engine prefills all but the last token.
 Also found: llama-server never calls `ggml_backend_load_all`, so
 `GGML_BACKEND_PATH` (the cards' backend) was ignored by it while
 llama-bench honoured it; the fork adds the call.
+
+## 2026-10-06, late: the cards beside the engine (open)
+
+With the cards' backend in the decode process and the prefill engine
+on, the server crashed within seconds every time (four runs, four
+sites: the CPU q6_K dot product, the tiled mixture unpack with a
+non-canonical pointer, a jump to a data address inside the backend's
+`host_rows_id` compute, a threadpool worker writing to the main
+thread's stack); never without the engine (0.37 tok/s at 32 decode
+threads, the known contention; 12 threads is the backend's rule), never
+without the backend (23.8 s, twice). Giving the prefill model the CUDA
+devices only (`PHI_PREFILL_DEVICES`) and building ggml without OpenMP
+changed the site, not the outcome. ECC reports no memory errors; the
+cards' memory is the resident share by design. The next build is the
+two-process form: a prefill llama-server on the GPUs, the engine as its
+client (`/completion` with the tokens, `/slots/0?action=save`), the
+saved-slot file (magic GGSQ, version 4, token count, tokens, then the
+state bytes) read into the decode server's prompt cache; no memory
+shared, so no race. Until then the working configuration is the engine
+with decode on the CPU and no cards' backend (`scripts/phi-serve.sh`
+run directly, not through `phi-ggml.sh`).
