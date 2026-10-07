@@ -7,6 +7,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "phi-prefill.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1015,6 +1016,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // llama.phi: prompts computed apart from this loop (phi-prefill.h)
+    phi_prefill prefill;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1043,6 +1047,7 @@ private:
         ctx_dft   = nullptr;
         model_dft = nullptr;
 
+        prefill.shutdown();
         llama_init.reset();
 
         ctx_tgt = nullptr;
@@ -1494,6 +1499,21 @@ private:
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        // llama.phi: the prefill engine, when asked for (PHI_PREFILL=1); it
+        // needs the prompt cache to hand its states over
+        if (!prefill.init(params_base)) {
+            return false;
+        }
+        if (prefill.enabled && !prompt_cache) {
+            SRV_ERR("%s", "llama.phi: PHI_PREFILL needs the prompt cache (--cache-ram N, or -1)\n");
+            return false;
+        }
+        // a finished prompt wakes the loop, which otherwise sleeps until a
+        // new task arrives and would leave the deferred one waiting
+        prefill.on_done = [this]() {
+            queue_tasks.pop_deferred_task(-1);
+        };
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -2599,6 +2619,31 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    // llama.phi: a completion's prompt goes to the prefill
+                    // engine; the task waits (deferred) until the finished
+                    // state is in the prompt cache, which the slot restores
+                    if (prefill.enabled && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
+                        if (prefill.is_waiting(id_task)) {
+                            if (!prefill.is_ready(id_task)) {
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                            const size_t n = prefill.drain(*prompt_cache);
+                            SRV_DBG("llama.phi: %zu prefilled state(s) moved to the prompt cache, id_task = %d\n", n, id_task);
+                        } else {
+                            int lcp_slots = 0;
+                            for (const auto & s : slots) {
+                                lcp_slots = std::max(lcp_slots, (int) s.prompt.tokens.get_common_prefix(task.tokens));
+                            }
+                            if (prefill.wants(task.tokens, prompt_cache.get(), lcp_slots)) {
+                                SRV_INF("llama.phi: prompt of %d tokens to the prefill engine, id_task = %d\n", task.n_tokens(), id_task);
+                                prefill.submit(id_task, task.tokens.get_text_tokens());
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                        }
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
