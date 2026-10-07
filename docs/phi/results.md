@@ -118,3 +118,65 @@ state bytes) read into the decode server's prompt cache; no memory
 shared, so no race. Until then the working configuration is the engine
 with decode on the CPU and no cards' backend (`scripts/phi-serve.sh`
 run directly, not through `phi-ggml.sh`).
+
+## 2026-10-06, night: the two-process form (`scripts/phi-serve.sh`, the fork)
+
+Built as planned: the prefill server (llama-server on the GPU placement,
+port 8002, `--slot-save-path /mnt/raid0/phi-prefill/`, one slot) and the
+decode server (port 8001, `-ngl 0`, 12 threads, the cards' backend with
+`PHI_GGML_TG_ONLY=1`), the engine in the decode server as the prefill
+server's client (`PHI_PREFILL_URL`, `PHI_PREFILL_DIR`): `/completion`
+with the prompt's tokens but the last, `n_predict` 0, then
+`/slots/0?action=save`, the file read and its tokens checked against
+what was sent. Both servers load the model from the raid0 copy.
+
+First run (`smoke-2proc-1.log`): no crash with the cards' backend beside
+the engine, which is what the form is for. The prefill server read 6033
+tokens at 354 tok/s (17.2 s). The import failed: `wrong sequence state
+magic`. The saved file holds the bytes of `state_seq_write_data` after
+its token list, while the buffer `llama_state_seq_set_data` takes starts
+with llama-context.cpp's own `io_magic` (0xaf143cd8) and the sequence
+id; `llama_state_seq_get_data` writes those two, the file writer does
+not. The engine now puts them in front of the file's state bytes. With
+the import failed the decode server read the prompt itself with 12 host
+threads under `PHI_GGML_TG_ONLY` (26.7 tok/s), and the short request's
+48 tokens rode in the prompt's batches (0.19 tok/s): upstream's
+coupling, which is what the engine removes once the state imports.
+
+Second run (`smoke-2proc-2.log`), the prefix in place: the state imports.
+
+| | short request (2 s into the long prompt) | long request (6034 tokens, 32 generated) |
+| --- | --- | --- |
+| wall | 29.2 s | 31.2 s |
+| prompt | 11 tokens, 0.68 s | prefill server 6033 tokens in 17.2 s (353 tok/s), then 1 token in the slot (0.33 s) |
+| generation | 48 tokens at 1.65 tok/s | 32 tokens at 4.21 tok/s |
+
+During the short request's generation the cards ran at 50 percent (114
+of 228 threads, the request's size) on all four, the GPUs at 72 to 96
+percent on the prefill: the two sides at once, the form the fork is for.
+Two things were wrong in the numbers. The long request's generation never
+reached the cards (0.1 percent while it ran): both slots were generating,
+and a step of two slots is a two-token multiply, which
+`PHI_GGML_TG_ONLY=1` keeps on the host. And 1.65 tok/s beside the prefill
+against 6.57 alone (`curl`, 64 tokens, the same server idle otherwise) is
+the prefill's host side, 24 threads streaming the experts of blocks 24 to
+47 through the memory bus the generation needs; the CPU showed 6 percent
+busy, the cards 50: neither was the limit, the bus was.
+
+`PHI_GGML_TG_ONLY` is now a count (the AVX-512 repo): a multiply of up
+to K tokens goes to the cards, K the slots generating at once; the
+launcher sets it to the slot count. Third run (`smoke-2proc-3.log`, the
+prefill server's slot still held the prompt from the run before, so the
+prefill was a cache hit and the GPUs idle):
+
+| | short request | long request | two slots at once, 48 tokens each, nothing else running |
+| --- | --- | --- | --- |
+| generation | 48 at 5.04 tok/s | 32 at 3.92 tok/s (the short one beside it) | 5.56 and 5.56 tok/s, the cards at 50 percent on all four |
+
+Standing: the two-process form works end to end with the cards in the
+decode path (three runs, no crash). Generation with the cards is 6.57
+tok/s alone against 7.1 on the CPU with 32 threads: the cards' fixed
+cost per multiply (the backend's known pole) eats what their bandwidth
+gives. Beside a real prefill the bus is shared with the prefill server's
+host side; the lever there is more of the prefill model in VRAM (the
+Q4_K_XL file fits 30 blocks, 560 tok/s), fewer prefill threads, or both.

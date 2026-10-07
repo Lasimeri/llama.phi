@@ -3,8 +3,12 @@
 
 #include "log.h"
 
+#include <cpp-httplib/httplib.h>
+
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <list>
 #include <map>
 
@@ -53,6 +57,32 @@ bool phi_prefill::init(const common_params & base) {
     if (!enabled) {
         return true;
     }
+    min_tokens = (size_t) env_int("PHI_PREFILL_MIN", 64);
+    n_ctx      = (int32_t) base.n_ctx;
+    if (const char * v = env_str("PHI_PREFILL_URL")) {
+        // the client form: the prefill server does the prompts
+        url = v;
+        const char * d = env_str("PHI_PREFILL_DIR");
+        if (!d) {
+            LOG_ERR("phi-prefill: PHI_PREFILL_URL needs PHI_PREFILL_DIR, the prefill server's --slot-save-path\n");
+            return false;
+        }
+        dir = d;
+        if (!dir.empty() && dir.back() != '/') {
+            dir += '/';
+        }
+        timeout_s = env_int("PHI_PREFILL_TIMEOUT", 3600);
+        httplib::Client cli(url);
+        cli.set_connection_timeout(5, 0);
+        auto res = cli.Get("/health");
+        if (!res || res->status != 200) {
+            LOG_WRN("phi-prefill: the prefill server at %s does not answer /health yet (%s); prompts go to it when it does\n",
+                    url.c_str(), res ? std::to_string(res->status).c_str() : httplib::to_string(res.error()).c_str());
+        }
+        worker = std::thread([this] { run(); });
+        LOG_INF("phi-prefill: ready, prompts of %zu tokens or more go to %s, states read from %s\n", min_tokens, url.c_str(), dir.c_str());
+        return true;
+    }
     common_params p = base;          // the decode side's settings, then the prefill's own
     p.warmup = false;
     p.n_batch  = env_int("PHI_PREFILL_BATCH",  4096);
@@ -89,7 +119,6 @@ bool phi_prefill::init(const common_params & base) {
             p.tensor_buft_overrides.push_back({nullptr, nullptr});
         }
     }
-    min_tokens = (size_t) env_int("PHI_PREFILL_MIN", 64);
     n_ubatch   = p.n_ubatch;
     // The prefill model's devices: those whose name starts with
     // PHI_PREFILL_DEVICES (default "CUDA"), so a backend meant for the
@@ -258,6 +287,112 @@ bool phi_prefill::compute(job & j, std::vector<uint8_t> & state) {
     return true;
 }
 
+// The client form: the prefill server computes all but the last token,
+// saves slot 0, and the saved file is read here. The state bytes after the
+// file's token list are exactly llama_state_seq_get_data's.
+bool phi_prefill::fetch(job & j, std::vector<uint8_t> & state) {
+    const llama_tokens sent(j.tokens.begin(), j.tokens.end() - 1);
+    httplib::Client cli(url);
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(timeout_s, 0);
+    cli.set_write_timeout(timeout_s, 0);
+
+    const json body = {
+        {"prompt",       sent},
+        {"n_predict",    0},
+        {"id_slot",      0},
+        {"cache_prompt", true},
+    };
+    auto res = cli.Post("/completion", body.dump(), "application/json");
+    if (!res) {
+        LOG_ERR("phi-prefill: %s/completion: %s (task %d)\n", url.c_str(), httplib::to_string(res.error()).c_str(), j.id_task);
+        return false;
+    }
+    if (res->status != 200) {
+        LOG_ERR("phi-prefill: %s/completion answered %d: %s (task %d)\n", url.c_str(), res->status, res->body.substr(0, 200).c_str(), j.id_task);
+        return false;
+    }
+    double pp_tok_s = 0;
+    try {
+        const json r = json::parse(res->body);
+        if (r.contains("timings")) {
+            pp_tok_s = r["timings"].value("prompt_per_second", 0.0);
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("phi-prefill: the completion's reply is not JSON: %s\n", e.what());
+    }
+
+    const std::string name = "phi-prefill-" + std::to_string(j.id_task) + ".bin";
+    const json save = {{"filename", name}};
+    auto res2 = cli.Post("/slots/0?action=save", save.dump(), "application/json");
+    if (!res2 || res2->status != 200) {
+        LOG_ERR("phi-prefill: %s/slots/0?action=save: %s (task %d)\n", url.c_str(),
+                res2 ? res2->body.substr(0, 200).c_str() : httplib::to_string(res2.error()).c_str(), j.id_task);
+        return false;
+    }
+
+    const std::string path = dir + name;
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        LOG_ERR("phi-prefill: cannot read %s: is PHI_PREFILL_DIR the prefill server's --slot-save-path? (task %d)\n", path.c_str(), j.id_task);
+        return false;
+    }
+    const size_t size = (size_t) f.tellg();
+    f.seekg(0);
+    uint32_t hdr[3];
+    bool ok = size >= sizeof(hdr) && f.read((char *) hdr, sizeof(hdr)).good();
+    if (ok && (hdr[0] != LLAMA_STATE_SEQ_MAGIC || hdr[1] != LLAMA_STATE_SEQ_VERSION)) {
+        LOG_ERR("phi-prefill: %s: magic %08x version %u, expected %08x %u (task %d)\n", path.c_str(),
+                hdr[0], hdr[1], LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION, j.id_task);
+        ok = false;
+    }
+    llama_tokens packed;
+    if (ok) {
+        const size_t n_packed = hdr[2];
+        ok = sizeof(hdr) + n_packed * sizeof(llama_token) <= size;
+        if (ok) {
+            packed.resize(n_packed);
+            ok = f.read((char *) packed.data(), n_packed * sizeof(llama_token)).good();
+        }
+    }
+    if (ok) {
+        // The file holds the bytes of state_seq_write_data; the buffer that
+        // llama_state_seq_set_data takes puts its own magic and the sequence
+        // id in front of them (llama-context.cpp, io_magic; the import checks
+        // the magic, so a drift there is said, not silent).
+        const uint32_t io_magic = 0xaf143cd8;
+        const int32_t  seq_id   = 0;
+        const size_t n_state = size - sizeof(hdr) - packed.size() * sizeof(llama_token);
+        state.resize(sizeof(io_magic) + sizeof(seq_id) + n_state);
+        memcpy(state.data(), &io_magic, sizeof(io_magic));
+        memcpy(state.data() + sizeof(io_magic), &seq_id, sizeof(seq_id));
+        ok = f.read((char *) state.data() + sizeof(io_magic) + sizeof(seq_id), n_state).good();
+    }
+    f.close();
+    std::remove(path.c_str());
+    if (!ok) {
+        LOG_ERR("phi-prefill: %s is short or unreadable (%zu bytes, task %d)\n", path.c_str(), size, j.id_task);
+        state.clear();
+        return false;
+    }
+    llama_tokens got;
+    try {
+        got = server_tokens::deserialize(packed, false).get_text_tokens();
+    } catch (const std::exception & e) {
+        LOG_ERR("phi-prefill: the saved slot's tokens: %s (task %d)\n", e.what(), j.id_task);
+        state.clear();
+        return false;
+    }
+    if (got != sent) {
+        LOG_ERR("phi-prefill: the prefill server saved %zu tokens, %zu were sent; its slot must be free for this engine alone (task %d)\n",
+                got.size(), sent.size(), j.id_task);
+        state.clear();
+        return false;
+    }
+    LOG_INF("phi-prefill: task %d: the prefill server read %zu tokens at %.1f tok/s\n", j.id_task, sent.size(), pp_tok_s);
+    return true;
+}
+
 void phi_prefill::run() {
     for (;;) {
         job j;
@@ -272,7 +407,7 @@ void phi_prefill::run() {
         }
         const int64_t t0 = ggml_time_us();
         std::vector<uint8_t> state;
-        const bool ok = compute(j, state);
+        const bool ok = url.empty() ? compute(j, state) : fetch(j, state);
         const int64_t dt = ggml_time_us() - t0;
         LOG_INF("phi-prefill: task %d: %zu tokens in %.2f s (%.1f tok/s), state %.1f MiB%s\n",
                 j.id_task, j.tokens.size(), dt / 1e6, j.tokens.size() * 1e6 / std::max<int64_t>(dt, 1),

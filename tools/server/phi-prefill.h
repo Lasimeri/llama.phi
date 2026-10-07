@@ -4,9 +4,24 @@
 // to the server's prompt cache, and the slot that takes the task restores it
 // and generates at once (docs/phi/README.md).
 //
-// Enabled by PHI_PREFILL=1. The prefill model is a second load of the same
-// file with its own placement, read from the environment (each unset one
-// keeps the server's value):
+// Enabled by PHI_PREFILL=1. Two forms:
+//
+// The client form (PHI_PREFILL_URL set): the prompts go to another
+// llama-server, the prefill server, started with the GPU placement and
+// --slot-save-path (scripts/phi-serve.sh starts both). The engine posts the
+// prompt to it (/completion, n_predict 0, slot 0), asks it to save the slot
+// (/slots/0?action=save), reads the saved file (LLAMA_STATE_SEQ_MAGIC,
+// version, the slot's packed tokens, then exactly the bytes of
+// llama_state_seq_get_data) and hands the state to this server's prompt
+// cache. No memory is shared between the two processes, so a backend in
+// this one (the cards') never runs beside the prefill's.
+//   PHI_PREFILL_URL     the prefill server, e.g. http://127.0.0.1:8002
+//   PHI_PREFILL_DIR     its --slot-save-path (a directory this server can read)
+//   PHI_PREFILL_TIMEOUT seconds to wait for one prompt (default 3600)
+//
+// The in-process form (no URL): the prefill model is a second load of the
+// same file in this process with its own placement, read from the
+// environment (each unset one keeps the server's value):
 //   PHI_PREFILL_TS      tensor split, "a/b/c/d" (one weight per GPU)
 //   PHI_PREFILL_OT      tensor buffer overrides, "pattern=buft,..." (as -ot)
 //   PHI_PREFILL_NGL     layers on the GPUs (as -ngl)
@@ -72,6 +87,12 @@ private:
         std::vector<uint8_t> state;
     };
 
+    // the client form
+    std::string url;
+    std::string dir;
+    int timeout_s = 3600;
+
+    // the in-process form
     common_init_result_ptr llama_init;
     llama_model   * model = nullptr;
     llama_context * ctx   = nullptr;
@@ -89,5 +110,6 @@ private:
     std::thread worker;
 
     void run();
-    bool compute(job & j, std::vector<uint8_t> & state);
+    bool compute(job & j, std::vector<uint8_t> & state);   // in-process
+    bool fetch(job & j, std::vector<uint8_t> & state);     // client
 };
