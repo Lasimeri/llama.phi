@@ -436,6 +436,16 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // llama.phi: LLAMA_PHI_PIPELINE=1 asks for the pipelining with the KV
+        // cache in host memory and with tensor overrides too (the rack's
+        // prefill placement has both); the device capability check below
+        // still applies
+        if (const char * v = getenv("LLAMA_PHI_PIPELINE"); v && atoi(v) != 0) {
+            pipeline_parallel = model.n_devices() > 1 &&
+                model.n_gpu_layers() > model.hparams.n_layer_all &&
+                model.split_mode() == LLAMA_SPLIT_MODE_LAYER;
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {

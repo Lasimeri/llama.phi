@@ -95,6 +95,10 @@ int llama_server(int argc, char ** argv) {
 
     std::setlocale(LC_NUMERIC, "C");
 
+    // llama.phi: the dynamic backends of GGML_BACKEND_PATH (the cards'
+    // libggml_phi.so), which llama-bench loads and this server did not
+    ggml_backend_load_all();
+
 #ifndef _WIN32
     // Ignore SIGPIPE so the server does not crash if a child (MCP server, tools runtime) exits while we are writing to its stdin
     signal(SIGPIPE, SIG_IGN);

@@ -41,3 +41,59 @@ c479922ac) with CUDA and the cards' backend entered from two threads.
 The server design in `README.md` stands. What the next measurements
 decide is the placement of each context's model: the prefill one for
 the GPUs at large batches, the decode one for the CPU and the cards.
+
+## 2026-10-06, later: the placement of each side (llama-bench, stock build)
+
+Prompts on the GPUs alone, batch 4096, ubatch 2048, KV in host memory,
+op offload on, the per-layer embeddings memory-mapped:
+
+| prefill model | blocks with experts in VRAM | pp4096 tok/s |
+| --- | --- | --- |
+| UD-Q6_K_XL, `-ts 6/6/6/30` | 0 to 23 | 440.1, 453.0 |
+| UD-Q4_K_XL, `-ts 8/8/8/24` | 0 to 29 | 560.5 |
+
+(With 28 Q6 blocks or 34 Q4 blocks the 2048-token compute buffers did
+not fit: `cudaMalloc failed`.) Generation on the CPU, no GPU:
+
+| decode side | tg64 tok/s |
+| --- | --- |
+| CPU, 32 threads | 7.62 |
+| CPU, 64 threads | 7.25 |
+| CPU, 12 threads, plus the four cards (row share, `PHI_GGML_PP_ONLY=0`) | 7.12 |
+| (the shared placement of the morning, GPUs and host) | 7.6 to 8.0 |
+
+So the decode side loses 5 percent by leaving the GPUs, and the GPUs
+then take the prompts five times faster. The cards do not help the
+decode on this host (the row share costs more than it saves at one
+token).
+
+`-sm row` (llama.cpp's own tensor parallelism) does not exist in this
+version for CUDA: `device CUDA0 does not support split buffers`. Its
+micro-batch pipelining across the GPUs is off whenever the KV cache is
+in host memory or any tensor override is set (`llama-context.cpp`,
+`pipeline_parallel`), which this placement needs; the fork adds
+`LLAMA_PHI_PIPELINE=1` to ask for it anyway, measured below.
+
+## 2026-10-06, later: the server (`scripts/phi-smoke.sh`, the fork)
+
+Decode on the CPU (32 threads, two slots, 131072 cells, Q8 K and V, one
+KV stream), the prefill engine on the GPUs with the Q6 placement above.
+A 6034-token prompt with 32 tokens to generate, and two seconds into
+it a short request generating 48 tokens.
+
+| | short request | long request | prefill engine |
+| --- | --- | --- | --- |
+| server reading its own prompts (first run, the state import failed) | 48 tokens at 6.9 tok/s, in flight during the prompt | 104.5 s wall: prompt 6034 tokens at 74.5 tok/s on the CPU, then 32 at 7.2 | 6034 tokens in 19.8 s (305 tok/s), unused |
+| engine's state restored (last token left to the slot) | 48 tokens at 6.5 tok/s, in flight during the prompt | **23.8 s wall: prompt 1 token (181 ms), then 32 at 7.1** | 6034 tokens in 19.1 s (315 tok/s) |
+
+Three defects met on the way, each fixed in the fork:
+`tensor_buft_overrides` must end with a null entry (the conversion
+asserts); the server's loop sleeps until a new task arrives, so a
+finished prefill has to wake it (`pop_deferred_task`); and the slot
+rewinds one position to recompute the last token's logits, which a
+recurrent layer cannot do (the slot then redid the prompt), so the
+engine prefills all but the last token.
+
+Also found: llama-server never calls `ggml_backend_load_all`, so
+`GGML_BACKEND_PATH` (the cards' backend) was ignored by it while
+llama-bench honoured it; the fork adds the call.
