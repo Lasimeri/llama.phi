@@ -1786,6 +1786,14 @@ private:
             }
         }
 
+        // llama.phi: an empty slot (new, or cleared after its idle save)
+        // restores its prompt from the cache, where the prefill engine puts
+        // its states; picked by id it skipped the similarity pass (f_keep
+        // 0/0), nothing was loaded and the slot read the prompt again
+        if (ret && ret->prompt.tokens.empty()) {
+            update_cache = true;
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
