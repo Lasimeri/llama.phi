@@ -716,6 +716,10 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
     ggml_build_forward_expand(gf, inp->tail_idxs);
+    // k_idxs too: the MTP graph's draft memory does not always store indexer
+    // keys, and an unread k_idxs was left without a buffer for set_input
+    // (GGML_ASSERT(buffer) in llama_kv_cache::set_input_k_idxs)
+    if (inp->k_idxs) ggml_build_forward_expand(gf, inp->k_idxs);
 
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
@@ -729,6 +733,11 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
+    // set_input fills these as well: allocated even when the graph (the MTP
+    // draft's) has no op reading them
+    ggml_build_forward_expand(gf, inp->new_pool_idxs);
+    ggml_build_forward_expand(gf, inp->new_pool_rep);
+    ggml_build_forward_expand(gf, inp->new_pool_pos);
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
