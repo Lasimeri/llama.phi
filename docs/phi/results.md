@@ -180,3 +180,62 @@ cost per multiply (the backend's known pole) eats what their bandwidth
 gives. Beside a real prefill the bus is shared with the prefill server's
 host side; the lever there is more of the prefill model in VRAM (the
 Q4_K_XL file fits 30 blocks, 560 tok/s), fewer prefill threads, or both.
+
+## 2026-10-07, night: the restored state, and the tensor split for the prefill
+
+**The handed-over state was not loaded (fixed, 9750f6ebf).** With the
+decode server restarted under the cards (expert placement, 12 threads) and
+the harness pinned to slot 1, the prefill server read the harness's
+9250-token prompt in 31.1 s (297 tok/s, state 256.9 MiB), and then the
+decode server's slot 1 read the same prompt again itself: 131.7 s at 70
+tok/s. The cause is upstream's `get_available_slot`: a slot picked by id
+skips the similarity pass, and when it is empty (new, or cleared after its
+idle save, `cache_idle_slots` being on by default) `f_keep` is 0/0, NaN,
+so the prompt cache is never consulted and the engine's state stays there
+unused. An empty slot now always restores from the cache. Measured after
+the fix on the live harness:
+
+| | before | after |
+| --- | --- | --- |
+| harness prompt, handed over | 9250 tokens: 31.1 s at the prefill server, then 131.7 s read again by the decode slot | 11561 tokens: 9.67 s (the prefill server's own cache held the start), then a 1-token prompt eval (0.22 s) |
+| the other slot meanwhile (`bench/async-2026-10-07/xslot.sh`, 22 prompt tokens, 64 generated, slot 0) | 0.44 tok/s: every step shared a 2047-token chunk of slot 1's local read | not measured beside a handoff yet; 4.1 tok/s with slot 1 generating beside it |
+
+A turn's increment (229 to 430 tokens) is still read by the decode server
+itself (`phi_prefill::wants`: mostly in a slot already), 35 to 58 tok/s,
+about 7 s a turn, and those steps hold up any other slot's generation the
+same way.
+
+**The tensor split for the prefill server** (`-sm tensor`, the meta
+device; `bench/tp-2026-10-07/tp.sh`, `tp2.sh`): one 9477-token prompt of
+real source (`prompt.json`), one server per arm on port 8012, arms
+interleaved, the production prefill server stopped meanwhile and started
+again unchanged; the decode server stayed up (1.6 GB on GPU 0). Same model
+(Q6_K_XL), `-c 131072 --kv-unified -fa on -ctk q8_0 -ctv q8_0 -b 4096 -t
+24 -tb 24`, experts of blocks 24 to 47 in host memory.
+
+| arm | tok/s, two rounds | mean SM busy, GPU 0 / 1 / 2 / 3 |
+| --- | --- | --- |
+| layer split (today's: `-ts 6/6/6/30 -nkvo -ub 2048`) | 304.6, 300.8; 304.6, 301.1 | 60-66 / 3-5 / 1-2 / 14-18 |
+| `-sm tensor -nkvo` | aborts: `ggml-backend-meta.cpp:830`, the gated delta net's state (src 5) in host memory has no split axis | |
+| `-sm tensor`, KV on the GPUs, `-ub 2048` | aborts: 2373 MiB more on GPU 0 does not fit (the split is even, GPU 0 also holds the decode server's 1.6 GB) | |
+| `-sm tensor`, experts of blocks 22 to 47 in host memory | 135.7, 136.3 | 12-14 / 12-15 / 12-13 / 15 |
+| `-sm tensor -ub 1024` | 142.0, 141.2 | 14-29 / 12-14 / 12-14 / 13-14 |
+
+The tensor split runs on this model, and its continuations (32 greedy
+tokens) read as the layer split's (one arm words one line differently),
+but it takes 2.2 times as long. The meta device has no `offload_op`
+(`ggml-backend-meta.cpp`, device interface): a multiply whose weights sit
+in host memory is not offloaded to any GPU, so the experts of the host
+blocks (24, or 26 in the first tensor arm) run on the 24 CPU threads while the four GPUs wait (12 to 15
+percent busy). Under the layer split the same experts are offloaded, all
+of them to GPU 0 (the first device that takes them), whose one x8 link
+carries the 45 GB a batch: GPU 0 busy 60 to 66 percent, the other three
+nearly idle. Without NCCL in this build (`GGML_CUDA_NCCL` off, no NCCL
+installed), four devices fall back to the meta device's butterfly
+all-reduce through host memory.
+
+Standing: the production prefill server stays on the layer split. The
+tensor split pays only if the host experts reach the GPUs: an `offload_op`
+in the meta device that sends each GPU its quarter of a host weight's rows
+over its own link (four x8 links instead of one) and lets the split
+machinery combine the results.
