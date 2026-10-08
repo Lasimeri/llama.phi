@@ -153,3 +153,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# the two-context feasibility test, built in place (tools/phi-twoctx)
+/tools/phi-twoctx/twoctx
