@@ -47,6 +47,12 @@ PHI_PREFILL_NGL=${PHI_PREFILL_NGL:-999}
 PHI_PREFILL_BATCH=${PHI_PREFILL_BATCH:-4096}
 PHI_PREFILL_UBATCH=${PHI_PREFILL_UBATCH:-2048}
 PHI_PREFILL_THREADS=${PHI_PREFILL_THREADS:-24}
+# Its KV: in host memory (-nkvo, PHI_PREFILL_NKVO=1) or on the GPUs (0): the
+# attention of every prompt chunk runs where the KV is (docs/phi/results.md,
+# 2026-10-08, the rate deep in context).
+PHI_PREFILL_NKVO=${PHI_PREFILL_NKVO:-1}
+nkvo=()
+[ "$PHI_PREFILL_NKVO" != 0 ] && nkvo=(-nkvo)
 if curl -sf "http://127.0.0.1:$pport/health" > /dev/null; then
     # A prefill server from an earlier start keeps its model loaded; it is
     # reused (and left running at exit), so the decode side can be restarted alone.
@@ -55,7 +61,7 @@ else
     echo "phi-serve: prefill server on the GPUs, port $pport, log $log/phi-prefill.log"
     env -u GGML_BACKEND_PATH "$srv" "${common[@]}" -np 1 --slot-save-path "$dir/" \
         -ngl "$PHI_PREFILL_NGL" -ts "$PHI_PREFILL_TS" -ot "$PHI_PREFILL_OT" \
-        -b "$PHI_PREFILL_BATCH" -ub "$PHI_PREFILL_UBATCH" -t "$PHI_PREFILL_THREADS" -tb "$PHI_PREFILL_THREADS" -nkvo \
+        -b "$PHI_PREFILL_BATCH" -ub "$PHI_PREFILL_UBATCH" -t "$PHI_PREFILL_THREADS" -tb "$PHI_PREFILL_THREADS" "${nkvo[@]}" \
         --host 127.0.0.1 --port "$pport" > "$log/phi-prefill.log" 2>&1 &
     pre=$!
     trap 'kill $pre 2>/dev/null; wait $pre 2>/dev/null' EXIT
@@ -66,14 +72,18 @@ else
     echo "phi-serve: prefill server up"
 fi
 
-# The decode server: the model on the CPU (-ngl 0), one KV stream, the prompt
-# cache unlimited (it carries the prefilled states), the engine in client form.
+# The decode server: the model on the CPU (-ngl 0), one KV stream, the engine
+# in client form, the prompt cache capped (it carries the prefilled states
+# and every slot's state saved before it loads one: 22 KiB a token, 2.1 GiB
+# at 99k tokens; the oldest entry goes when the cap is reached, and an entry
+# that is a prefix of a newer one goes at once).
 export PHI_PREFILL=1
 export PHI_PREFILL_URL="http://127.0.0.1:$pport"
 export PHI_PREFILL_DIR="$dir"
 export PHI_PREFILL_MIN=${PHI_PREFILL_MIN:-64}
 slots=${PHI_SLOTS:-2}
-decode=("$srv" "${common[@]}" -ngl 0 -np "$slots" --cache-ram -1 --host 0.0.0.0 --port "$port")
+cache=${PHI_CACHE_RAM:-24576}
+decode=("$srv" "${common[@]}" -ngl 0 -np "$slots" --cache-ram "$cache" --host 0.0.0.0 --port "$port")
 if [ "$cards" != 0 ]; then
     # The cards take the generation steps' multiplies (PHI_GGML_TG_ONLY=K: up
     # to K tokens, one per slot generating at once), the host 12 threads

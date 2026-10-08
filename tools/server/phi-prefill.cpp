@@ -207,6 +207,7 @@ void phi_prefill::submit(int id_task, const llama_tokens & tokens) {
     {
         std::lock_guard<std::mutex> lk(mtx);
         waiting.insert(id_task);
+        submitted.insert(id_task);
         queue.push_back({id_task, tokens});
     }
     cv.notify_one();
@@ -222,6 +223,130 @@ bool phi_prefill::is_ready(int id_task) {
     return finished.count(id_task) > 0;
 }
 
+bool phi_prefill::was_submitted(int id_task) {
+    std::lock_guard<std::mutex> lk(mtx);
+    return submitted.count(id_task) > 0;
+}
+
+void phi_prefill::forget(int id_task) {
+    std::lock_guard<std::mutex> lk(mtx);
+    submitted.erase(id_task);
+}
+
+// The state a job will hold is its tokens but the last; it covers the task
+// when that is a prefix of the task's tokens longer than what any slot holds.
+static bool job_covers(const llama_tokens & job, const server_tokens & tokens, size_t lcp_known) {
+    if (job.size() < 2) {
+        return false;
+    }
+    const size_t n = job.size() - 1;
+    if (n <= lcp_known || n > tokens.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (job[i] != tokens[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool phi_prefill::covers(const server_tokens & tokens, size_t lcp_known) {
+    std::lock_guard<std::mutex> lk(mtx);
+    if (busy && job_covers(current.tokens, tokens, lcp_known)) {
+        return true;
+    }
+    for (const auto & j : queue) {
+        if (job_covers(j.tokens, tokens, lcp_known)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int phi_prefill::submit_prefetch(const llama_tokens & tokens, std::string & err) {
+    if (!enabled) {
+        err = "the prefill engine is off (PHI_PREFILL=1 starts it)";
+        return -1;
+    }
+    if (tokens.size() < 2) {
+        err = "a prefetch needs at least 2 tokens (the state holds all but the last)";
+        return -1;
+    }
+    if (n_ctx > 0 && (int32_t) tokens.size() >= n_ctx) {
+        err = "the prompt does not fit the context (" + std::to_string(tokens.size()) + " of " + std::to_string(n_ctx) + " tokens)";
+        return -1;
+    }
+    int id;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        id = next_prefetch_id++;
+        // the records are bounded: the oldest settled one goes first, then the oldest
+        while (prefetches.size() >= 64) {
+            auto victim = prefetches.end();
+            for (auto it = prefetches.begin(); it != prefetches.end(); ++it) {
+                if (it->second.status == PREFETCH_DONE || it->second.status == PREFETCH_FAILED) {
+                    victim = it;
+                    break;
+                }
+            }
+            prefetches.erase(victim == prefetches.end() ? prefetches.begin() : victim);
+        }
+        prefetches[id] = {tokens, PREFETCH_WAITING, ""};
+        waiting.insert(id);
+        queue.push_back({id, tokens});
+    }
+    cv.notify_one();
+    LOG_INF("phi-prefill: prefetch %d: %zu tokens to the prefill engine\n", id, tokens.size());
+    return id;
+}
+
+std::string phi_prefill::prefetch_state(int id, std::string * reason) {
+    std::lock_guard<std::mutex> lk(mtx);
+    auto it = prefetches.find(id);
+    if (it == prefetches.end()) {
+        return "";
+    }
+    if (reason) {
+        *reason = it->second.reason;
+    }
+    switch (it->second.status) {
+        case PREFETCH_WAITING: return finished.count(id) > 0 ? "ready" : "waiting";
+        case PREFETCH_READY:   return "ready";
+        case PREFETCH_DONE:    return "done";
+        case PREFETCH_FAILED:  return "failed";
+    }
+    return "";
+}
+
+void phi_prefill::audit(const server_prompt_cache & cache) {
+    std::lock_guard<std::mutex> lk(mtx);
+    for (auto & [id, rec] : prefetches) {
+        if (rec.status != PREFETCH_READY) {
+            continue;
+        }
+        const size_t n = rec.tokens.size() - 1;
+        bool present = false;
+        for (const auto & st : cache.states) {
+            if (st.prompt.tokens.size() != n) {
+                continue;
+            }
+            size_t i = 0;
+            while (i < n && st.prompt.tokens[i] == rec.tokens[i]) {
+                i++;
+            }
+            if (i == n) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            rec.status = PREFETCH_DONE;
+            LOG_INF("phi-prefill: prefetch %d: its state left the prompt cache (loaded or replaced)\n", id);
+        }
+    }
+}
+
 size_t phi_prefill::drain(server_prompt_cache & cache) {
     std::deque<done> got;
     {
@@ -230,6 +355,13 @@ size_t phi_prefill::drain(server_prompt_cache & cache) {
         for (const auto & d : got) {
             waiting.erase(d.id_task);
             finished.erase(d.id_task);
+            auto it = prefetches.find(d.id_task);
+            if (it != prefetches.end()) {
+                it->second.status = d.state.empty() ? PREFETCH_FAILED : PREFETCH_READY;
+                if (d.state.empty()) {
+                    it->second.reason = last_error.empty() ? "the prefill engine could not compute the prompt" : last_error;
+                }
+            }
         }
     }
     for (auto & d : got) {
@@ -239,12 +371,31 @@ size_t phi_prefill::drain(server_prompt_cache & cache) {
         server_prompt prompt;
         d.tokens.pop_back();   // the entry covers what the state holds: all but the last token
         prompt.tokens = server_tokens(d.tokens, false);
+        // An entry that holds these tokens and more (an older branch of the
+        // same sequence) makes the cache decline this state, and a slot
+        // taking that entry for a task that continues past these tokens
+        // differently has to drop the rest: a hybrid memory cannot, and
+        // reads the task's prompt again from a checkpoint or from zero.
+        // The state computed for exactly these tokens replaces such entries.
+        for (auto it = cache.states.begin(); it != cache.states.end();) {
+            if (it->prompt.tokens.size() >= prompt.tokens.size() && it->prompt.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size()) {
+                LOG_INF("phi-prefill: %s %d: a cache entry of %zu tokens (%.1f MiB) held its %zu tokens and more; replaced by the state of exactly these\n",
+                        d.id_task >= PREFETCH_ID_BASE ? "prefetch" : "task", d.id_task, it->prompt.tokens.size(), it->size() / 1048576.0, prompt.tokens.size());
+                it = cache.states.erase(it);
+            } else {
+                ++it;
+            }
+        }
         auto * st = cache.alloc(prompt, d.state.size(), 0);
         if (!st) {
-            LOG_WRN("phi-prefill: the prompt cache refused a state of %zu bytes (raise --cache-ram)\n", d.state.size());
+            LOG_WRN("phi-prefill: the prompt cache refused a state of %.1f MiB (its limit is %.1f MiB; raise --cache-ram)\n",
+                    d.state.size() / 1048576.0, cache.limit_size / 1048576.0);
             continue;
         }
         memcpy(st->data.main.data(), d.state.data(), d.state.size());
+        LOG_INF("phi-prefill: %s %d: state of %zu tokens (%.1f MiB) in the prompt cache: %zu entries, %.1f MiB\n",
+                d.id_task >= PREFETCH_ID_BASE ? "prefetch" : "task", d.id_task, prompt.tokens.size(),
+                d.state.size() / 1048576.0, cache.states.size(), cache.size() / 1048576.0);
     }
     return got.size();
 }
@@ -389,7 +540,8 @@ bool phi_prefill::fetch(job & j, std::vector<uint8_t> & state) {
         state.clear();
         return false;
     }
-    LOG_INF("phi-prefill: task %d: the prefill server read %zu tokens at %.1f tok/s\n", j.id_task, sent.size(), pp_tok_s);
+    LOG_INF("phi-prefill: %s %d: the prefill server read %zu tokens at %.1f tok/s\n",
+            j.id_task >= PREFETCH_ID_BASE ? "prefetch" : "task", j.id_task, sent.size(), pp_tok_s);
     return true;
 }
 
@@ -404,16 +556,24 @@ void phi_prefill::run() {
             }
             j = std::move(queue.front());
             queue.pop_front();
+            current = j;   // covers() sees the job in flight
+            busy = true;
         }
         const int64_t t0 = ggml_time_us();
         std::vector<uint8_t> state;
         const bool ok = url.empty() ? compute(j, state) : fetch(j, state);
         const int64_t dt = ggml_time_us() - t0;
-        LOG_INF("phi-prefill: task %d: %zu tokens in %.2f s (%.1f tok/s), state %.1f MiB%s\n",
+        LOG_INF("phi-prefill: %s %d: %zu tokens in %.2f s (%.1f tok/s), state %.1f MiB%s\n",
+                j.id_task >= PREFETCH_ID_BASE ? "prefetch" : "task",
                 j.id_task, j.tokens.size(), dt / 1e6, j.tokens.size() * 1e6 / std::max<int64_t>(dt, 1),
                 state.size() / 1048576.0, ok ? "" : " FAILED");
         {
             std::lock_guard<std::mutex> lk(mtx);
+            busy = false;
+            current.tokens.clear();
+            if (!ok) {
+                last_error = "the prefill engine could not compute " + std::to_string(j.tokens.size()) + " tokens (the decode server's log says why)";
+            }
             n_prompts++;
             n_tokens += (int64_t) j.tokens.size();
             t_prefill_us += dt;

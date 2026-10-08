@@ -156,6 +156,9 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    // llama.phi: the prefetch API (phi-prefill.h)
+    server_http_context::handler_t post_phi_prefetch;
+    server_http_context::handler_t get_phi_prefetch;
 
     // to be used in router mode
     json get_model_info() const;

@@ -57,6 +57,40 @@ server, 64), `--cache-ram` on (`-1` for no limit), `--kv-unified` and
 the same K and V types on both contexts (a state imports only into the
 same layout). The prefill server's slot belongs to the engine alone.
 
+### Prefetch: a prompt read ahead of its completion
+
+A client that keeps one live sequence in a pinned slot (Phi Stream's
+harness, slot 1) gets its input while the slot is generating. It hands
+the input over at once, without a slot or a task, and the GPUs read it
+while the slot keeps generating:
+
+```
+POST /phi/prefetch  {"tokens": [...]}        -> {"id": N, "n_tokens": n}   at once
+GET  /phi/prefetch?id=N                      -> {"id": N, "state": "waiting"}
+                                                "waiting"  queued or being read
+                                                "ready"    computed; in the prompt cache, or there with the next completion
+                                                "done"     the state left the cache: a slot loaded it, a longer prompt replaced it, or the cap evicted it
+                                                "failed"   plus "error": the reason; a completion reads the prompt itself
+                                                404        an unknown id
+```
+
+The tokens are the live history up to the input, then the input; the
+state holds all but the last of them (as the engine's own prefills do).
+The client then sends its completion with those tokens followed by
+whatever the slot generated meanwhile, and the slot reads only that
+last token plus the generated ones. Two rules in `server-context.cpp`
+make the slot take the state: every completion task drains the engine's
+finished states into the prompt cache before a slot is chosen, and a
+slot picked by id that holds a shorter prefix of the task than the cache
+does (its own earlier turn plus what it generated, against the task's
+prompt itself) saves itself and loads the entry (`get_available_slot`;
+upstream only looks at the cache when the slot would lose half its
+context, and a hybrid memory that must drop tokens past the common
+prefix cannot rewind: it reads the prompt again from a checkpoint or
+from zero). A completion that arrives while a job in flight covers its
+prompt waits for that job instead of reading the prompt itself. Ids are
+in their own range (from 2^30), never a task's.
+
 ## The rack (`scripts/phi-serve.sh`)
 
 One command starts both servers and stops both on Ctrl-C:
@@ -73,8 +107,12 @@ embeddings in host memory, batch 4096, ubatch 2048, 24 threads, KV in
 host memory, states saved under `/mnt/raid0/phi-prefill`. Decode server:
 the model on the CPU (`-ngl 0`) under the AVX-512 backend
 (`phi-ggml.sh`, `PHI_GGML_TG_ONLY=1`: the four cards take the generation
-steps' multiplies, never a prompt's), 12 host threads. The numbers behind
-each choice and every command are in `docs/phi/results.md`.
+steps' multiplies, never a prompt's), 12 host threads, the prompt cache
+capped at `PHI_CACHE_RAM` MiB (24576: a state is 22 KiB a token, 2.1 GiB
+at 99k tokens, and a slot saves its own state before it loads a better
+entry; the oldest entry goes at the cap, an entry that is a prefix of a
+newer one goes at once). The numbers behind each choice and every
+command are in `docs/phi/results.md`.
 
 ## Build
 

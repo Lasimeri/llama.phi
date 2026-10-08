@@ -239,3 +239,106 @@ tensor split pays only if the host experts reach the GPUs: an `offload_op`
 in the meta device that sends each GPU its quarter of a host weight's rows
 over its own link (four x8 links instead of one) and lets the split
 machinery combine the results.
+
+## 2026-10-08: the prompt read ahead of its completion (prefetch), and the pinned slot that loads it
+
+The harness keeps one live sequence in slot 1 and gets its input while
+that slot is generating. Until today its only way to have the input read
+was to send the whole prompt as the next completion: the decode server
+read the increment itself (57 to 68 tok/s, `phi-decode.log`, a 1580-token
+turn 27 s) while the slot stood still, and a prompt that did not extend
+the slot's own tokens cost a re-read from a checkpoint or from zero (a
+hybrid memory cannot rewind: `llama_memory_hybrid::seq_pos_min` is the
+recurrent tail, so a task that shares fewer tokens than the slot holds
+trips `pos_min >= pos_min_thold` in `update_slots`).
+
+Three things changed in `tools/server` (the prefill engine, the server's
+slot selection, two routes):
+
+1. `POST /phi/prefetch {"tokens": [...]}` answers `{"id": N, "n_tokens":
+   n}` at once; the engine reads the prompt (all but its last token, as
+   it does for a task) on the prefill server while the slots keep
+   generating; no slot and no task are involved. `GET /phi/prefetch?id=N`
+   answers `{"id": N, "state": s}` with `waiting` (queued or being read),
+   `ready` (computed; in the decode server's prompt cache, or there with
+   the next completion), `done` (the state left the cache: a slot loaded
+   it, a longer prompt replaced it, or the cap evicted it) or `failed`
+   (with `"error"`: the reason; a completion then reads the prompt
+   itself); an unknown id is 404, an empty or one-token list 400. The ids
+   start at 2^30, above any task id; the engine files them under its own
+   records (64 kept). Every completion task drains the engine's finished
+   states into the cache before a slot is chosen, and `update_slots`
+   drains on every pass, so a state is in the cache within one decode
+   step of the prefill server finishing it.
+2. `get_available_slot`: a slot picked by id that holds a shorter prefix
+   of the task than a cache entry does saves itself and loads the entry
+   (the cache's own criteria, `server_prompt_cache::load`, applied first,
+   so the save is never for nothing). Upstream looks at the cache only
+   when the slot would lose half its context (`f_keep < 0.5`), and the
+   pinned slot after a prefetch holds its earlier turn plus what it
+   generated meanwhile, `f_keep` near 1. A slot still processing is left
+   alone (the empty-slot rule of 9750f6ebf had no such guard). A
+   completion whose prompt a job in flight covers with a longer prefix
+   than any slot holds waits for that job (`phi_prefill::covers`), and a
+   task whose prefill failed is not submitted again (`was_submitted`).
+3. The drain replaces a cache entry that holds the prefetched tokens
+   and more (an older branch of the same sequence): `alloc` would
+   decline the state as already held, and a slot taking the longer entry
+   for a task that continues past the prefix differently cannot drop the
+   rest. The first forced injection below ran into exactly that.
+
+Memory: the decode server ran `--cache-ram -1` beside a 188 GB model in a
+251 GB host. A state is 22 KiB a token (412.1 MiB for 19189 tokens, 237.4
+MiB for 7999, 714.6 MiB for 38570; 2.1 GiB at 99k), and a slot that loads
+a better entry first saves its own, so each injection leaves one state
+of the live sequence's length behind. `scripts/phi-serve.sh` now gives
+`--cache-ram ${PHI_CACHE_RAM:-24576}`: the oldest entry goes when the cap
+is reached (`server_prompt_cache::alloc`, `update`), an entry that is a
+prefix of a newer one goes at once, and the cap also lifts the cache's
+token limit (with `-1` the token limit is `n_ctx`, 131072 tokens in all:
+one 99k state would have evicted the other; with a cap it is the cap
+over the measured bytes a token, about 1.1M tokens).
+
+**The forced injection** (`bench/async-2026-10-08/inject3.sh`, log
+`inject3.log`; the decode server on this build with the production
+config, cards 0 to 2, the harness live in slot 1 throughout; slot 0 for
+every request; H = 3500 tokens of `calib-code.txt`, T = 4500 tokens of
+`server-common.cpp`, everything greedy, `temperature 0, top_k 1`):
+
+| step | request on slot 0 | prompt eval | what happened |
+| --- | --- | --- | --- |
+| a | H, 64 tokens | 1 token, 0.26 s | the engine read H on the GPUs (26.5 s in all), the slot restored it; the slot holds H+G |
+| ref | H+T+G, 8 tokens | 1 token, 0.30 s | the engine read H+T+G[:-1] on the GPUs (52.7 s in all, the state 238 MiB); the slot, holding H+G, saved itself and loaded it (the new rule); reference tokens `20668 11 18738 20668 553 4310 1070 1518` |
+| a2 | H, 64 tokens | 3500 tokens, 51.5 s at 68 tok/s | the slot held H+T+G+ref; upstream saved it (f_keep below 0.5) and the hybrid memory read H again from zero: the cost the prefetch removes; the slot holds H+G' |
+| prefetch | `POST /phi/prefetch` H+T | | `{"id":1073741824,"n_tokens":8000}` at once; `waiting` for 9.8 s (the prefill server's slot held H+T from ref: 7999 tokens at 3600 tok/s of its own cache), then `ready`; the drain replaced the entry of step a2 (H+T+G+ref, which held H+T and more) with the state of exactly H+T[:-1] |
+| c | H+T+G, 8 tokens | **65 tokens, 4.73 s** | the slot, holding H+G', saved itself and loaded the prefetched entry, read T[-1]+G (65 = |G|+1) and generated `20668 11 18738 20668 553 4310 1070 1518`: **equal to the reference**, which came from a different split of the same computation (the GPUs through H+T+G[:-1] there, the GPUs through H+T[:-1] and the CPU with the cards through 65 tokens here); `GET` then says `done` |
+
+The decode log of step c: `selected slot by id (0)`, then `llama.phi: the
+prompt cache holds 7999 of the task's 8064 tokens, the slot 3500: the
+slot saves itself and loads the entry`, then `prompt eval time = 4731 ms
+/ 65 tokens`. An unknown id answers 404, an empty token list 400. The
+first run of the day (`inject.sh`, same steps in another order) showed
+the entry-replacement need: with step ref's long entry still in the
+cache the prefetched state was declined as "already in the cache" and
+step c loaded the long entry and read 1 token, correct because that
+entry happened to continue with the same G; a harness whose G differs
+would have re-read.
+
+**Measurement 1, generation beside a prefill** (`decode-rate.sh`, log
+`decode-rate.log`): slot 0, a 19-token prompt, 128 greedy tokens with
+`ignore_eos`, alone and while the prefill server reads a 16000-token
+prompt (`POST` to port 8002, `n_predict 0`, a different prompt each
+round so its slot cannot hit its own cache), two rounds interleaved.
+The harness's slot 1 generated throughout (so "alone" is two slots, as
+in production).
+
+| round | alone | beside the prefill | the prefill itself |
+| --- | --- | --- | --- |
+| 1 | 4.13 tok/s | 2.10 tok/s | 16000 tokens in 79.5 s, 201 tok/s |
+| 2 | 3.99 tok/s | 2.24 tok/s | 16000 tokens in 78.1 s, 205 tok/s |
+
+Generation keeps 51 to 56 percent of its rate beside a prefill (the Q6
+run of 2026-10-06 kept 25 percent, 1.65 of 6.57): the 16000-token read
+is 8 ubatches, each streaming the 29 host blocks' experts over GPU 0's
+link, and the generation shares the memory bus with that stream for 78
+s. The prefill's host threads are the knob below.

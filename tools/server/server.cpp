@@ -306,6 +306,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // llama.phi: a prompt read ahead by the prefill engine (phi-prefill.h)
+    ctx_http.post("/phi/prefetch",             ex_wrapper(routes.post_phi_prefetch));
+    ctx_http.get ("/phi/prefetch",             ex_wrapper(routes.get_phi_prefetch));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

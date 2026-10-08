@@ -974,6 +974,10 @@ public:
         metrics.reset_bucket();
     }
 
+    // llama.phi: prompts computed apart from this loop (phi-prefill.h); the
+    // prefetch routes reach it from the HTTP threads (it guards its own state)
+    phi_prefill prefill;
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1015,9 +1019,6 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
-
-    // llama.phi: prompts computed apart from this loop (phi-prefill.h)
-    phi_prefill prefill;
 
     server_metrics metrics;
 
@@ -1789,9 +1790,38 @@ private:
         // llama.phi: an empty slot (new, or cleared after its idle save)
         // restores its prompt from the cache, where the prefill engine puts
         // its states; picked by id it skipped the similarity pass (f_keep
-        // 0/0), nothing was loaded and the slot read the prompt again
-        if (ret && ret->prompt.tokens.empty()) {
+        // 0/0), nothing was loaded and the slot read the prompt again. A
+        // slot still processing is left alone (its task's own prompt is
+        // what the memory holds).
+        if (ret && !ret->is_processing() && ret->prompt.tokens.empty()) {
             update_cache = true;
+        }
+
+        // llama.phi: a slot holding a shorter prefix of the task than the
+        // prompt cache does saves itself and loads the entry. This is the
+        // slot picked by id after a prefetch: it holds its earlier turn plus
+        // what it generated meanwhile, the cache the task's prompt itself,
+        // so its own f_keep is near 1 and upstream never looks at the
+        // cache; left to its own state, a hybrid memory that must drop the
+        // tokens past the common prefix cannot rewind and reads the prompt
+        // again from a checkpoint or from zero. The cache's own criteria
+        // (server_prompt_cache::load) are applied here, so the save is
+        // never made for nothing.
+        if (ret && !update_cache && prompt_cache && !ret->is_processing() && !ret->prompt.tokens.empty() && !task.tokens.empty()) {
+            const size_t lcp_slot    = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const float  f_keep_slot = float(lcp_slot) / ret->prompt.tokens.size();
+            const float  f_sim_slot  = float(lcp_slot) / task.tokens.size();
+            for (const auto & st : prompt_cache->states) {
+                const size_t lcp    = st.prompt.tokens.get_common_prefix(task.tokens);
+                const float  f_keep = float(lcp) / st.prompt.tokens.size();
+                const float  f_sim  = float(lcp) / task.tokens.size();
+                if (lcp > lcp_slot && f_keep >= 0.25f && f_keep > f_keep_slot && f_sim > f_sim_slot) {
+                    SLT_INF(*ret, "llama.phi: the prompt cache holds %zu of the task's %zu tokens, the slot %zu: the slot saves itself and loads the entry\n",
+                            lcp, task.tokens.size(), lcp_slot);
+                    update_cache = true;
+                    break;
+                }
+            }
         }
 
         if (ret) {
@@ -1812,6 +1842,10 @@ private:
                 }
 
                 prompt_cache->update();
+
+                if (prefill.enabled) {
+                    prefill.audit(*prompt_cache);   // llama.phi: a loaded prefetch is done
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2628,21 +2662,32 @@ private:
 
                     const int id_task = task.id;
 
-                    // llama.phi: a completion's prompt goes to the prefill
-                    // engine; the task waits (deferred) until the finished
-                    // state is in the prompt cache, which the slot restores
+                    // llama.phi: every finished prompt (the engine's prefills,
+                    // the clients' prefetches) lands in the prompt cache first,
+                    // so the slot chosen below can restore one. A completion
+                    // whose own prompt is still being read waits (deferred),
+                    // and so does one that a job in flight will cover with a
+                    // longer prefix than any slot holds; a prompt worth
+                    // reading apart goes to the engine and its task waits too.
                     if (prefill.enabled && task.type == SERVER_TASK_TYPE_COMPLETION && !task.is_parent()) {
-                        if (prefill.is_waiting(id_task)) {
-                            if (!prefill.is_ready(id_task)) {
-                                queue_tasks.defer(std::move(task));
-                                break;
-                            }
-                            const size_t n = prefill.drain(*prompt_cache);
+                        const size_t n = prefill.drain(*prompt_cache);
+                        if (n > 0) {
                             SRV_DBG("llama.phi: %zu prefilled state(s) moved to the prompt cache, id_task = %d\n", n, id_task);
-                        } else {
+                            prefill.audit(*prompt_cache);
+                        }
+                        if (prefill.is_waiting(id_task)) {
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                        if (!prefill.was_submitted(id_task)) {
                             int lcp_slots = 0;
                             for (const auto & s : slots) {
                                 lcp_slots = std::max(lcp_slots, (int) s.prompt.tokens.get_common_prefix(task.tokens));
+                            }
+                            if (prefill.covers(task.tokens, lcp_slots)) {
+                                SRV_DBG("llama.phi: a prompt in flight covers this one, id_task = %d waits for it\n", id_task);
+                                queue_tasks.defer(std::move(task));
+                                break;
                             }
                             if (prefill.wants(task.tokens, prompt_cache.get(), lcp_slots)) {
                                 SRV_INF("llama.phi: prompt of %d tokens to the prefill engine, id_task = %d\n", task.n_tokens(), id_task);
@@ -2673,6 +2718,11 @@ private:
                         break;
                     }
 
+                    // llama.phi: the task has its slot; the engine's note of it is done with
+                    if (prefill.enabled) {
+                        prefill.forget(id_task);
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -2699,6 +2749,9 @@ private:
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
+                                    if (prefill.enabled) {
+                                        prefill.audit(*prompt_cache);   // llama.phi: the limit may have evicted a prefetch
+                                    }
                                 }
 
                                 if (params_base.kv_unified) {
@@ -3061,6 +3114,15 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // llama.phi: a prompt the engine finished lands in the prompt cache
+        // on this pass of the loop (a prefetch turns "ready" while the slots
+        // generate, no task needed)
+        if (prefill.enabled && prompt_cache) {
+            if (prefill.drain(*prompt_cache) > 0) {
+                prefill.audit(*prompt_cache);
+            }
+        }
 
         // check if all slots are idle
         {
@@ -5174,6 +5236,69 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    // llama.phi: the prefetch API (phi-prefill.h). POST /phi/prefetch
+    // {"tokens": [...]} answers {"id": N} at once: the prompt goes to the
+    // prefill engine, no slot and no task; GET /phi/prefetch?id=N answers
+    // {"id": N, "state": "waiting" | "ready" | "done" | "failed"}. Both run
+    // on the HTTP thread (the engine guards its own state); the state moves
+    // into the prompt cache on the main loop.
+    this->post_phi_prefetch = [this](const server_http_req & req) {
+        auto res = create_response();
+        llama_tokens tokens;
+        try {
+            const json body = json::parse(req.body);
+            const auto & arr = body.at("tokens");
+            if (!arr.is_array()) {
+                throw std::runtime_error("\"tokens\" must be an array of token ids");
+            }
+            tokens.reserve(arr.size());
+            for (const auto & t : arr) {
+                if (!t.is_number_integer()) {
+                    throw std::runtime_error("\"tokens\" must be an array of token ids");
+                }
+                const int64_t v = t.get<int64_t>();
+                if (v < 0 || v >= meta->model_vocab_n_tokens) {
+                    throw std::runtime_error("token id " + std::to_string(v) + " is outside the vocabulary");
+                }
+                tokens.push_back((llama_token) v);
+            }
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::string err;
+        const int id = ctx_server.prefill.submit_prefetch(tokens, err);
+        if (id < 0) {
+            res->error(format_error_response(err, ctx_server.prefill.enabled ? ERROR_TYPE_INVALID_REQUEST : ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        res->ok({{"id", id}, {"n_tokens", tokens.size()}});
+        return res;
+    };
+
+    this->get_phi_prefetch = [this](const server_http_req & req) {
+        auto res = create_response();
+        int id = -1;
+        try {
+            id = std::stoi(req.get_param("id"));
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid prefetch id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::string reason;
+        const std::string state = ctx_server.prefill.prefetch_state(id, &reason);
+        if (state.empty()) {
+            res->error(format_error_response("Unknown prefetch id", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        json out = {{"id", id}, {"state", state}};
+        if (state == "failed") {
+            out["error"] = reason;
+        }
+        res->ok(out);
         return res;
     };
 
