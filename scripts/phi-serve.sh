@@ -92,11 +92,31 @@ plan() {
     case "$M" in
         *-of-*.gguf) shards=("${M%-*-of-*.gguf}"-*-of-*.gguf) ;;
     esac
-    local gpus
-    gpus=$(nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ') || { echo "phi-serve: no nvidia-smi: set PHI_PREFILL_TS and PHI_PREFILL_OT" >&2; return 1; }
     local held=""
     local ppid
     ppid=$(pgrep -f "llama-server.*--port $pport" | head -1)
+    # A server stopped just before this start can hold its GPU memory a few
+    # seconds after its process is gone; a plan made then sees full GPUs and
+    # puts every block's experts in host memory (2026-10-09: -ts 0/0/0/48,
+    # all 241.6 GB of BF16 experts on the host, GPUs 1 and 2 empty). So the
+    # plan waits until no process but the prefill server being reused holds
+    # 256 MiB or more of a GPU (the rack's compositor keeps a few MiB on
+    # each), at most PHI_GPU_WAIT seconds (60), then plans around whatever
+    # is still there and says so.
+    local waited=0 other
+    while :; do
+        other=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | awk -F, -v p="${ppid:-none}" '$1 != p && $2 >= 256 {print $1; exit}')
+        [ -z "$other" ] && break
+        if [ "$waited" -ge "${PHI_GPU_WAIT:-60}" ]; then
+            echo "phi-serve: process $other still holds GPU memory after $waited s; the plan counts it as used" >&2
+            break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    [ "$waited" -gt 0 ] && echo "phi-serve: waited $waited s for the GPUs to be released" >&2
+    local gpus
+    gpus=$(nvidia-smi --query-gpu=index,memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ') || { echo "phi-serve: no nvidia-smi: set PHI_PREFILL_TS and PHI_PREFILL_OT" >&2; return 1; }
     if [ -n "$ppid" ]; then
         held=$(nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits | tr -d ' ' | awk -F, -v p="$ppid" '$1 == p {print $2 "," $3}')
         held=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits | tr -d ' ' | awk -F, -v h="$held" 'BEGIN {n = split(h, a, "\n"); for (i = 1; i <= n; i++) {split(a[i], b, ","); u[b[1]] = b[2]}} {print $1 "," (u[$2] + 0)}')
