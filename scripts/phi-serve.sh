@@ -17,6 +17,8 @@
 #   phi-serve.sh plan [MODEL]   print the prefill model's placement for MODEL
 #                               (default PHI_MODEL) and start nothing
 #   PHI_CARDS=0 phi-serve.sh    decode on the CPU alone (32 threads), no cards
+#   PHI_ENGINE=one phi-serve.sh one server instead of the two: prompts and generation in one
+#                               batch stream (GPUs, CPU, cards), the placement the same
 #
 # The prefill model's placement follows the model file: scripts/phi-gguf.c
 # reads the shards' headers for the bytes of every block's experts and
@@ -169,6 +171,36 @@ else
     echo "phi-serve: placement from the environment: -ts $PHI_PREFILL_TS -ot $PHI_PREFILL_OT"
 fi
 [ "$plan_only" = 1 ] && exit 0
+
+# One engine (PHI_ENGINE=one): a single server on PHI_PORT instead of the
+# two, the prefill server's placement (the GPUs hold the blocks the plan
+# gives them, every block's attention and the KV; the experts past them
+# stay in host memory) and llama-server's continuous batching, so a
+# prompt's chunks and the slots' generated tokens share its batches and
+# neither waits for a hand-off. With the cards (PHI_CARDS not 0) the
+# backend takes generation steps alone (PHI_GGML_TG_ONLY, a step of up to
+# that many tokens), the host-memory weights' rows split across every
+# card (no PHI_GGML_EXPERTS: each multiply divided card by card); prompt
+# chunks stay with the GPUs and the host. -t is the generation's threads
+# (12 beside the cards, 32 without), -tb the prompt's (PHI_PREFILL_THREADS).
+if [ "${PHI_ENGINE:-two}" = one ]; then
+    mkdir -p "$log" || exit 1
+    slots=${PHI_SLOTS:-2}
+    cache=${PHI_CACHE_RAM:-24576}
+    one=("$srv" "${common[@]}" -np "$slots" --cache-ram "$cache" \
+        -ngl "$PHI_PREFILL_NGL" -ts "$PHI_PREFILL_TS" -ot "$PHI_PREFILL_OT" \
+        -b "$PHI_PREFILL_BATCH" -ub "$PHI_PREFILL_UBATCH" "${nkvo[@]}" \
+        --host 0.0.0.0 --port "$port")
+    if [ "$cards" != 0 ]; then
+        t=${PHI_DECODE_THREADS:-12}
+        export PHI_GGML_TG_ONLY=${PHI_GGML_TG_ONLY:-$slots}
+        echo "phi-serve: one engine: prompts on the GPUs, generation on the GPUs, the CPU ($t threads) and the cards, port $port, log $log/phi-engine.log"
+        exec "$avx/scripts/phi-ggml.sh" "${one[@]}" -t "$t" -tb "$PHI_PREFILL_THREADS" "$@" > "$log/phi-engine.log" 2>&1
+    fi
+    t=${PHI_DECODE_THREADS:-32}
+    echo "phi-serve: one engine: prompts on the GPUs, generation on the GPUs and the CPU ($t threads), port $port, log $log/phi-engine.log"
+    exec env -u GGML_BACKEND_PATH "${one[@]}" -t "$t" -tb "$PHI_PREFILL_THREADS" "$@" > "$log/phi-engine.log" 2>&1
+fi
 
 mkdir -p "$dir" "$log" || exit 1
 rm -f "$dir"/phi-prefill-*.bin
