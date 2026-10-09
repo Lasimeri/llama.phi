@@ -62,6 +62,9 @@ cards=${PHI_CARDS:-1}
 # Both contexts must share one KV layout: the state saved by one imports
 # only into the other's (one stream, Q8 K and V, flash attention).
 common=(-m "$M" -c "$ctx" --kv-unified -fa on -ctk q8_0 -ctv q8_0 --jinja)
+# The person's sampling (2026-10-09), the default of every request that
+# does not set its own (the harness sends the same values per request).
+common+=(--temp 0.5 --top-k 75 --top-p 0.95 --min-p 0.05 --repeat-penalty 1.2)
 
 # The prefill server: its KV on the GPUs (PHI_PREFILL_NKVO=0, the default)
 # or in host memory (1, -nkvo). On the GPUs the attention of every prompt
