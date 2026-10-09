@@ -380,3 +380,40 @@ the prompt's rate falls with the chunk and a generating slot still waits
 a whole step a token. Both caps default to off. Mixing prompts into
 generation steps needs the prompt's experts off the host's memory bus
 (the GPUs or the cards holding them), not smaller steps.
+
+## 2026-10-09: the plan's wait for the GPUs, the two-process form on BF16, and the page cache
+
+`scripts/phi-serve.sh` planned the GPUs while a server stopped just
+before still held its memory, and the plan put every block's experts in
+host memory (`-ts 0/0/0/48`: all 241.6 GB of BF16 experts on the host,
+GPUs 1 and 2 empty; decode near 11.5 tok/s instead of 15). The plan now
+waits until every GPU's used memory, less what a reused prefill server
+holds there, reads under 512 MiB (the rack's compositor keeps a few MiB
+on each), at most `PHI_GPU_WAIT` seconds (60). Waiting on the driver's
+process list was not enough: the memory still read as used after the
+process had left it.
+
+The two-process form on the BF16 file, measured with the
+AVX-512 repository's `bench/bench-setups3.sh` method (the user's text as
+prompts, 128 greedy tokens, major faults from `/proc/vmstat` per test;
+the full table is that repository's
+`docs/results/2026-10-09-bf16-cards-whole-experts.md`):
+
+| | prompt | generation | major faults |
+| --- | --- | --- | --- |
+| two servers (decode on the CPU and the cards) | 15.4 tok/s | 2.4, 4.0, 2.1 | 1.1 million in the prompt, 1.5 million in three decodes |
+| one engine, no cards, settled | 106 tok/s | 14.2, 14.6 | 1,831 to 6,373 a decode |
+
+The decode server sees no GPU, so every block's experts (241.6 GB) and
+the dense weights are host memory beside the prefill server's, more than
+the page cache holds next to everything else in 251 GB: it reads its
+experts back from the NVMe all the time. On this host the decode side of
+the two-process form needs a file that fits in RAM (Q8_0, 176 GB).
+
+The one engine itself is not free of the page cache: after a restart
+the GPU blocks read at load push host experts out, and a decode can
+stall on them (one took 48,000 major faults, 2.2 GB read, 0.24 tok/s);
+decodes run 7 to 8 tok/s for some minutes before settling at 14 to 15.
+And every restart makes the harness re-read its whole context (84k
+tokens, about 13 minutes), streaming the host experts beside whatever
+else runs.
