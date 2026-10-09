@@ -99,12 +99,14 @@ plan() {
         held=$(nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits | tr -d ' ' | awk -F, -v p="$ppid" '$1 == p {print $2 "," $3}')
         held=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits | tr -d ' ' | awk -F, -v h="$held" 'BEGIN {n = split(h, a, "\n"); for (i = 1; i <= n; i++) {split(a[i], b, ","); u[b[1]] = b[2]}} {print $1 "," (u[$2] + 0)}')
     fi
-    # The decode server opens a CUDA context on every GPU even at -ngl 0
-    # (about 1700 MiB on GPU 0, 450 on the others, measured 2026-10-08 with
-    # GPU 0 left 883 MiB free): reserved when it is not yet running (once it
-    # runs, nvidia-smi already counts it). PHI_DECODE_GPU0_MIB, PHI_DECODE_GPU_MIB.
+    # The decode server sees no GPU (below) unless PHI_DECODE_CUDA=1; then it
+    # opens a CUDA context on every GPU even at -ngl 0 (about 1700 MiB on GPU
+    # 0, 450 on the others, measured 2026-10-08 with GPU 0 left 883 MiB free;
+    # more with a larger model's compute buffers), reserved when it is not yet
+    # running (once it runs, nvidia-smi already counts it).
+    # PHI_DECODE_GPU0_MIB, PHI_DECODE_GPU_MIB.
     local dres0=0 dres=0
-    if ! pgrep -f "llama-server.*--port $port( |$)" > /dev/null; then
+    if [ "${PHI_DECODE_CUDA:-0}" = 1 ] && ! pgrep -f "llama-server.*--port $port( |$)" > /dev/null; then
         dres0=${PHI_DECODE_GPU0_MIB:-1700}; dres=${PHI_DECODE_GPU_MIB:-450}
     fi
     "$gguf" "${shards[@]}" | awk -v gpus="$gpus" -v held="$held" -v dres0="$dres0" -v dres="$dres" -v ctx="$ctx" -v kv_on_gpu="$([ "$PHI_PREFILL_NKVO" = 0 ] && echo 1 || echo 0)" \
@@ -202,6 +204,13 @@ export PHI_PREFILL_MIN=${PHI_PREFILL_MIN:-64}
 slots=${PHI_SLOTS:-2}
 cache=${PHI_CACHE_RAM:-24576}
 decode=("$srv" "${common[@]}" -ngl 0 -np "$slots" --cache-ram "$cache" --host 0.0.0.0 --port "$port")
+# Its weights and KV are on the host (-ngl 0) and every prompt of
+# PHI_PREFILL_MIN tokens or more is read by the prefill server, so the GPUs
+# do nothing for it: they are hidden from it (no CUDA context, no compute
+# buffer on them; with BF16 its 2070 MiB buffer on GPU 0 did not fit beside
+# the prefill server, 2026-10-08). PHI_DECODE_CUDA=1 shows them again.
+hide=(env CUDA_VISIBLE_DEVICES=)
+[ "${PHI_DECODE_CUDA:-0}" = 1 ] && hide=()
 if [ "$cards" != 0 ]; then
     # The cards take the generation steps' multiplies (PHI_GGML_TG_ONLY=K: up
     # to K tokens, one per slot generating at once), the host 12 threads
@@ -209,9 +218,9 @@ if [ "$cards" != 0 ]; then
     t=${PHI_DECODE_THREADS:-12}
     export PHI_GGML_TG_ONLY=${PHI_GGML_TG_ONLY:-$slots}
     echo "phi-serve: decode server on the CPU ($t threads) and the cards, port $port, log $log/phi-decode.log"
-    "$avx/scripts/phi-ggml.sh" "${decode[@]}" -t "$t" -tb "$t" "$@" 2>&1 | tee "$log/phi-decode.log"
+    "${hide[@]}" "$avx/scripts/phi-ggml.sh" "${decode[@]}" -t "$t" -tb "$t" "$@" 2>&1 | tee "$log/phi-decode.log"
 else
     t=${PHI_DECODE_THREADS:-32}
     echo "phi-serve: decode server on the CPU ($t threads), no cards, port $port, log $log/phi-decode.log"
-    "${decode[@]}" -t "$t" -tb "$t" "$@" 2>&1 | tee "$log/phi-decode.log"
+    "${hide[@]}" "${decode[@]}" -t "$t" -tb "$t" "$@" 2>&1 | tee "$log/phi-decode.log"
 fi
