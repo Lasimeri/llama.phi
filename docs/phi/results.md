@@ -342,3 +342,41 @@ run of 2026-10-06 kept 25 percent, 1.65 of 6.57): the 16000-token read
 is 8 ubatches, each streaming the 29 host blocks' experts over GPU 0's
 link, and the generation shares the memory bus with that stream for 78
 s. The prefill's host threads are the knob below.
+
+## 2026-10-08 evening: one engine, BF16, and why prompts are not mixed into generation
+
+Qwen3.8 Flash Next BF16 (330 GB, more than the host's 251 GB): the GPUs
+hold blocks 0 to 8 whole and every block's attention and KV, the experts
+of blocks 9 to 47 (196 GB) and the per-layer embeddings stay in host
+memory (scripts/phi-serve.sh's plan, -ts 2/3/3/40). The cards take BF16
+since Intel-Phi-AVX512 61411e5 but hold 0.1 percent of the experts' rows
+at 4.4 GB a card. 128 greedy tokens, a prompt of 8507 tokens of this
+directory's own documents:
+
+| | generation | prompt |
+| --- | --- | --- |
+| two servers (decode on the CPU, 32 threads; prefill on the GPUs) | 5.3 tok/s | 113 tok/s |
+| one engine (PHI_ENGINE=one), cards 0-2 | 15.3, 14.8 | 121, 114 |
+| one engine, no cards | 15.5, 15.7 | 122, 115 |
+
+One engine runs generation for the GPUs' blocks and all attention on the
+GPUs: three times the two servers. It is the rack's configuration now.
+
+A request that arrives 3 s into a long prompt waited for the whole
+prompt (44 s), and a slot generating while another read a prompt got one
+token per step. Caps on the prompt tokens a step reads
+(tools/server/server-context.cpp: PHI_MIX_PROMPT while a slot generates,
+PHI_PROMPT_CHUNK otherwise) were measured and lose:
+
+| cap | prompt alone | generation beside the prompt | the newcomer's wait |
+| --- | --- | --- | --- |
+| none (n_batch 4096) | 121 tok/s | after the prompt | 44 s |
+| PHI_MIX_PROMPT 256 or 128 | 111, 109 | 13.6, 13.7 (after the prompt) | 44, 45 s |
+| PHI_PROMPT_CHUNK 512 | 31 | 0.49 | 26 s |
+
+Every step that holds prompt tokens streams the host-memory experts
+whatever its size, so a short step costs nearly what a long one does:
+the prompt's rate falls with the chunk and a generating slot still waits
+a whole step a token. Both caps default to off. Mixing prompts into
+generation steps needs the prompt's experts off the host's memory bus
+(the GPUs or the cards holding them), not smaller steps.

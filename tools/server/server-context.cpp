@@ -3430,6 +3430,29 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // phi: caps on the prompt tokens a step reads (one engine,
+        // scripts/phi-serve.sh PHI_ENGINE=one): PHI_MIX_PROMPT while a slot
+        // generates (its sampled token is in the batch already), PHI_PROMPT_CHUNK
+        // otherwise; both default to 0, off. Measured 2026-10-08 with Flash Next
+        // BF16 (experts of 39 blocks in host memory) they lose: every step with
+        // prompt tokens streams those experts from memory whatever its size, so
+        // 512-token chunks read a prompt at 31 tok/s against 121 and a slot
+        // generating beside it still got 0.5 tok/s (docs/phi/results.md).
+        static const int32_t phi_mix_prompt = [] {
+            const char * e = getenv("PHI_MIX_PROMPT");
+            return e ? atoi(e) : 0;
+        }();
+        static const int32_t phi_prompt_chunk = [] {
+            const char * e = getenv("PHI_PROMPT_CHUNK");
+            return e ? atoi(e) : 0;
+        }();
+        int32_t n_prompt_cap = n_batch;
+        if (batch.size() > 0) {
+            if (phi_mix_prompt > 0) n_prompt_cap = std::min(n_batch, (int32_t) batch.size() + phi_mix_prompt);
+        } else if (phi_prompt_chunk > 0) {
+            n_prompt_cap = std::min(n_batch, phi_prompt_chunk);
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3438,7 +3461,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_prompt_cap) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3893,7 +3916,7 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_prompt_cap) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
