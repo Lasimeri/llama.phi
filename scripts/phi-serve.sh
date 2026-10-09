@@ -98,17 +98,22 @@ plan() {
     # A server stopped just before this start can hold its GPU memory a few
     # seconds after its process is gone; a plan made then sees full GPUs and
     # puts every block's experts in host memory (2026-10-09: -ts 0/0/0/48,
-    # all 241.6 GB of BF16 experts on the host, GPUs 1 and 2 empty). So the
-    # plan waits until no process but the prefill server being reused holds
-    # 256 MiB or more of a GPU (the rack's compositor keeps a few MiB on
-    # each), at most PHI_GPU_WAIT seconds (60), then plans around whatever
-    # is still there and says so.
-    local waited=0 other
+    # all 241.6 GB of BF16 experts on the host, GPUs 1 and 2 empty), and
+    # the memory can still read as used after the process has left the
+    # driver's process list. So the plan waits until every GPU's used
+    # memory, less what the prefill server being reused holds there, is
+    # under 512 MiB (the rack's compositor keeps a few MiB on each), at
+    # most PHI_GPU_WAIT seconds (60), then plans around whatever is still
+    # there and says so.
+    local waited=0 busy
     while :; do
-        other=$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | awk -F, -v p="${ppid:-none}" '$1 != p && $2 >= 256 {print $1; exit}')
-        [ -z "$other" ] && break
+        busy=$(nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' |
+            awk -F, -v p="${ppid:-none}" -v apps="$(nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')" '
+                BEGIN { n = split(apps, a, "\n"); for (i = 1; i <= n; i++) { split(a[i], b, ","); if (b[1] == p) keep[b[2]] += b[3] } }
+                $3 - keep[$2] >= 512 { printf "%s%s (%d MiB)", sep, $1, $3 - keep[$2]; sep = ", " }')
+        [ -z "$busy" ] && break
         if [ "$waited" -ge "${PHI_GPU_WAIT:-60}" ]; then
-            echo "phi-serve: process $other still holds GPU memory after $waited s; the plan counts it as used" >&2
+            echo "phi-serve: GPU $busy still in use after $waited s; the plan counts it as used" >&2
             break
         fi
         sleep 2
